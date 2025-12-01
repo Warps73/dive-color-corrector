@@ -2,6 +2,10 @@ import sys
 import numpy as np
 import cv2
 import math
+import subprocess
+import os
+import argparse
+from pathlib import Path
 from PIL import Image
 
 THRESHOLD_RATIO = 2000
@@ -9,6 +13,7 @@ MIN_AVG_RED = 60
 MAX_HUE_SHIFT = 120
 BLUE_MAGIC_VALUE = 1.2
 SAMPLE_SECONDS = 2 # Extracts color correction from every N seconds
+RED_FILTER_REDUCTION = 0.7 # Reduction factor for red channel when using red filter
 
 def hue_shift_red(mat, h):
 
@@ -36,11 +41,16 @@ def normalizing_interval(array):
 
     return (low, high)
 
-def apply_filter(mat, filt):
+def apply_filter(mat, filt, red_filter=False):
     filtered_mat = np.zeros_like(mat, dtype=np.float32)
     filtered_mat[..., 0] = mat[..., 0] * filt[0] + mat[..., 1] * filt[1] + mat[..., 2] * filt[2] + filt[4] * 255
     filtered_mat[..., 1] = mat[..., 1] * filt[6] + filt[9] * 255
     filtered_mat[..., 2] = mat[..., 2] * filt[12] + filt[14] * 255
+    
+    # If red filter is enabled, reduce red channel saturation
+    if red_filter:
+        filtered_mat[..., 0] = filtered_mat[..., 0] * RED_FILTER_REDUCTION
+    
     return np.clip(filtered_mat, 0, 255).astype(np.uint8)
 
 def get_filter_matrix(mat):
@@ -116,17 +126,17 @@ def get_filter_matrix(mat):
         0, 0, 0, 1, 0,
     ])
 
-def correct(mat):
+def correct(mat, red_filter=False):
     original_mat = mat.copy()
 
     filter_matrix = get_filter_matrix(mat)
     
-    corrected_mat = apply_filter(original_mat, filter_matrix)
+    corrected_mat = apply_filter(original_mat, filter_matrix, red_filter=red_filter)
     corrected_mat = cv2.cvtColor(corrected_mat, cv2.COLOR_RGB2BGR)
 
     return corrected_mat
 
-def correct_image(input_path, output_path):
+def correct_image(input_path, output_path, red_filter=False):
     exif_data = None
     with Image.open(input_path) as image:
         exif_data = image.info.get("exif")
@@ -135,7 +145,7 @@ def correct_image(input_path, output_path):
         mat = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
     rgb_mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
-    corrected_mat = correct(rgb_mat)
+    corrected_mat = correct(rgb_mat, red_filter=red_filter)
 
     output_image = Image.fromarray(cv2.cvtColor(corrected_mat, cv2.COLOR_BGR2RGB))
     save_kwargs = {}
@@ -212,7 +222,7 @@ def precompute_filter_matrices(frame_count, filter_indices, filter_matrices):
         interpolated_matrices[:, x] = np.interp(frame_numbers, filter_indices, filter_matrices[:, x])
     return interpolated_matrices
 
-def process_video(video_data, yield_preview=False):
+def process_video(video_data, yield_preview=False, red_filter=False):
     cap = cv2.VideoCapture(video_data["input_video_path"])
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -251,7 +261,7 @@ def process_video(video_data, yield_preview=False):
 
         # Apply the filter using precomputed matrix
         rgb_mat = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        corrected_mat = apply_filter(rgb_mat, interpolated_matrices[count - 1])
+        corrected_mat = apply_filter(rgb_mat, interpolated_matrices[count - 1], red_filter=red_filter)
         corrected_mat = cv2.cvtColor(corrected_mat, cv2.COLOR_RGB2BGR)
         new_video.write(corrected_mat)
 
@@ -268,37 +278,106 @@ def process_video(video_data, yield_preview=False):
             yield None
 
     
-
+    
     cap.release()
     new_video.release()
+    
+    # Add audio from original video using ffmpeg
+    temp_output = video_data["output_video_path"] + ".temp.mp4"
+    os.rename(video_data["output_video_path"], temp_output)
+    
+    print("\nAdding audio...")
+    ffmpeg_cmd = [
+        'ffmpeg', '-i', temp_output, '-i', video_data["input_video_path"],
+        '-c:v', 'copy', '-c:a', 'copy', '-map', '0:v:0', '-map', '1:a:0?',
+        '-shortest', video_data["output_video_path"], '-y'
+    ]
+    
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+        os.remove(temp_output)
+    except subprocess.CalledProcessError:
+        # If ffmpeg fails, keep the video without audio
+        os.rename(temp_output, video_data["output_video_path"])
+        print("Warning: Could not add audio track")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Dive video/image color corrector')
+    parser.add_argument('mode', choices=['image', 'video', 'batch'], help='Processing mode')
+    parser.add_argument('input', help='Input file or directory path')
+    parser.add_argument('output', help='Output file or directory path')
+    parser.add_argument('--red-filter', action='store_true', 
+                        help='Reduce red saturation (use when camera has red filter)')
+    
+    args = parser.parse_args()
 
-    if len(sys.argv) < 2:
-        print("Usage")
-        print("-"*20)
-        print("For image:")
-        print("$python correct.py image <source_image_path> <output_image_path>\n")
-        print("-"*20)
-        print("For video:")
-        print("$python correct.py video <source_video_path> <output_video_path>\n")
-        exit(0)
-
-    if (sys.argv[1]) == "image":
-        mat = cv2.imread(sys.argv[2])
+    if args.mode == "image":
+        mat = cv2.imread(args.input)
         mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
         
-        corrected_mat = correct(mat)
+        corrected_mat = correct(mat, red_filter=args.red_filter)
 
-        cv2.imwrite(sys.argv[3], corrected_mat)
+        cv2.imwrite(args.output, corrected_mat)
     
-    else:
-
-        for item in analyze_video(sys.argv[2], sys.argv[3]):
-
+    elif args.mode == "video":
+        for item in analyze_video(args.input, args.output):
             if type(item) == dict:
                 video_data = item
             
-        [x for x in process_video(video_data, yield_preview=False)]
+        [x for x in process_video(video_data, yield_preview=False, red_filter=args.red_filter)]
+    
+    else:  # batch mode
+        input_dir = Path(args.input)
+        output_dir = Path(args.output)
+        
+        if not input_dir.is_dir():
+            print(f"Error: {args.input} is not a directory")
+            exit(1)
+        
+        # Create output directory if it doesn't exist
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Supported video extensions
+        video_extensions = ['.mp4', '.MP4', '.mov', '.MOV', '.avi', '.AVI', '.mkv', '.MKV']
+        image_extensions = ['.jpg', '.JPG', '.jpeg', '.JPEG', '.png', '.PNG']
+        
+        # Find all videos and images
+        files = []
+        for ext in video_extensions + image_extensions:
+            files.extend(list(input_dir.glob(f'*{ext}')))
+        
+        if not files:
+            print(f"No video or image files found in {args.input}")
+            exit(0)
+        
+        print(f"Found {len(files)} file(s) to process")
+        
+        for i, input_file in enumerate(files, 1):
+            output_file = output_dir / input_file.name
+            print(f"\n[{i}/{len(files)}] Processing {input_file.name}...")
+            
+            # Check if it's a video or image
+            if input_file.suffix in video_extensions:
+                try:
+                    for item in analyze_video(str(input_file), str(output_file)):
+                        if type(item) == dict:
+                            video_data = item
+                    
+                    [x for x in process_video(video_data, yield_preview=False, red_filter=args.red_filter)]
+                    print(f"✓ Completed {input_file.name}")
+                except Exception as e:
+                    print(f"✗ Error processing {input_file.name}: {e}")
+            
+            elif input_file.suffix in image_extensions:
+                try:
+                    mat = cv2.imread(str(input_file))
+                    mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
+                    corrected_mat = correct(mat, red_filter=args.red_filter)
+                    cv2.imwrite(str(output_file), corrected_mat)
+                    print(f"✓ Completed {input_file.name}")
+                except Exception as e:
+                    print(f"✗ Error processing {input_file.name}: {e}")
+        
+        print(f"\nBatch processing complete! Processed {len(files)} file(s).")
         

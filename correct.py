@@ -7,6 +7,11 @@ import os
 import argparse
 from pathlib import Path
 from PIL import Image
+try:
+    import piexif
+    HAS_PIEXIF = True
+except ImportError:
+    HAS_PIEXIF = False
 
 THRESHOLD_RATIO = 2000
 MIN_AVG_RED = 60
@@ -14,6 +19,8 @@ MAX_HUE_SHIFT = 120
 BLUE_MAGIC_VALUE = 1.2
 SAMPLE_SECONDS = 2 # Extracts color correction from every N seconds
 RED_FILTER_REDUCTION = 0.7 # Reduction factor for red channel when using red filter
+MAX_GAIN = 3.0  # Clamp per-channel gain to avoid over-whitening
+STRENGTH_DEFAULT = 0.85  # Blend strength for corrected output
 
 def hue_shift_red(mat, h):
 
@@ -111,6 +118,11 @@ def get_filter_matrix(mat):
     green_gain = 256 / (adjust_g_high - adjust_g_low)
     blue_gain = 256 / (adjust_b_high - adjust_b_low)
 
+    # Clamp gains to avoid excessive brightening/whitening
+    red_gain = min(red_gain, MAX_GAIN)
+    green_gain = min(green_gain, MAX_GAIN)
+    blue_gain = min(blue_gain, MAX_GAIN)
+
     redOffset = (-adjust_r_low / 256) * red_gain
     greenOffset = (-adjust_g_low / 256) * green_gain
     blueOffset = (-adjust_b_low / 256) * blue_gain
@@ -126,7 +138,7 @@ def get_filter_matrix(mat):
         0, 0, 0, 1, 0,
     ])
 
-def correct(mat, red_filter=False):
+def correct(mat, red_filter=False, strength: float = STRENGTH_DEFAULT):
     original_mat = mat.copy()
 
     filter_matrix = get_filter_matrix(mat)
@@ -134,23 +146,34 @@ def correct(mat, red_filter=False):
     corrected_mat = apply_filter(original_mat, filter_matrix, red_filter=red_filter)
     corrected_mat = cv2.cvtColor(corrected_mat, cv2.COLOR_RGB2BGR)
 
+    # Blend with original to reduce over-correction
+    original_bgr = cv2.cvtColor(original_mat, cv2.COLOR_RGB2BGR)
+    strength = float(max(0.0, min(1.0, strength)))
+    corrected_mat = cv2.addWeighted(corrected_mat, strength, original_bgr, 1.0 - strength, 0)
+
     return corrected_mat
 
-def correct_image(input_path, output_path, red_filter=False):
-    exif_data = None
+def correct_image(input_path, output_path, red_filter=False, strength: float = STRENGTH_DEFAULT):
+    # Load image and preserve all metadata
     with Image.open(input_path) as image:
-        exif_data = image.info.get("exif")
+        # Save all metadata (EXIF, ICC profile, etc.)
+        metadata = image.info.copy()
         if image.mode != "RGB":
             image = image.convert("RGB")
         mat = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
     rgb_mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
-    corrected_mat = correct(rgb_mat, red_filter=red_filter)
+    corrected_mat = correct(rgb_mat, red_filter=red_filter, strength=strength)
 
     output_image = Image.fromarray(cv2.cvtColor(corrected_mat, cv2.COLOR_BGR2RGB))
+    
+    # Restore all metadata to output
     save_kwargs = {}
-    if exif_data:
-        save_kwargs["exif"] = exif_data
+    if "exif" in metadata:
+        save_kwargs["exif"] = metadata["exif"]
+    if "icc_profile" in metadata:
+        save_kwargs["icc_profile"] = metadata["icc_profile"]
+    
     output_image.save(output_path, **save_kwargs)
     
     preview = mat.copy()
@@ -166,7 +189,7 @@ def analyze_video(input_video_path, output_video_path):
     
     # Initialize new video writer
     cap = cv2.VideoCapture(input_video_path)
-    fps = math.ceil(cap.get(cv2.CAP_PROP_FPS))
+    fps = cap.get(cv2.CAP_PROP_FPS)
     frame_count = math.ceil(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     # Get filter matrices for every 10th frame
@@ -193,7 +216,8 @@ def analyze_video(input_video_path, output_video_path):
             continue
 
         # Pick filter matrix from every N seconds
-        if count % (fps * SAMPLE_SECONDS) == 0:
+        interval = max(1, int(round(fps * SAMPLE_SECONDS)))
+        if count % interval == 0:
             mat = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             filter_matrix_indexes.append(count) 
             filter_matrices.append(get_filter_matrix(mat))
@@ -222,7 +246,7 @@ def precompute_filter_matrices(frame_count, filter_indices, filter_matrices):
         interpolated_matrices[:, x] = np.interp(frame_numbers, filter_indices, filter_matrices[:, x])
     return interpolated_matrices
 
-def process_video(video_data, yield_preview=False, red_filter=False):
+def process_video(video_data, yield_preview=False, red_filter=False, strength: float = STRENGTH_DEFAULT):
     cap = cv2.VideoCapture(video_data["input_video_path"])
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -263,6 +287,10 @@ def process_video(video_data, yield_preview=False, red_filter=False):
         rgb_mat = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         corrected_mat = apply_filter(rgb_mat, interpolated_matrices[count - 1], red_filter=red_filter)
         corrected_mat = cv2.cvtColor(corrected_mat, cv2.COLOR_RGB2BGR)
+        # Blend with original frame to reduce over-correction
+        s = float(video_data.get("strength", strength))
+        s = float(max(0.0, min(1.0, s)))
+        corrected_mat = cv2.addWeighted(corrected_mat, s, frame, 1.0 - s, 0)
         new_video.write(corrected_mat)
 
         if yield_preview:
@@ -287,11 +315,23 @@ def process_video(video_data, yield_preview=False, red_filter=False):
     os.rename(video_data["output_video_path"], temp_output)
     
     print("\nAdding audio...")
-    ffmpeg_cmd = [
-        'ffmpeg', '-i', temp_output, '-i', video_data["input_video_path"],
-        '-c:v', 'copy', '-c:a', 'copy', '-map', '0:v:0', '-map', '1:a:0?',
-        '-shortest', video_data["output_video_path"], '-y'
-    ]
+    codec = video_data.get("codec", "libx264")
+    crf = str(video_data.get("crf", 18))
+    preset = video_data.get("preset", "medium")
+    pix_fmt = video_data.get("pix_fmt", "yuv420p")
+    copy_audio = video_data.get("copy_audio", True)
+
+    ffmpeg_cmd = ['ffmpeg', '-i', temp_output]
+    if copy_audio:
+        ffmpeg_cmd += ['-i', video_data["input_video_path"], '-map', '0:v:0', '-map', '1:a:0?']
+    else:
+        ffmpeg_cmd += ['-map', '0:v:0']
+    ffmpeg_cmd += ['-c:v', codec, '-crf', crf, '-preset', preset, '-pix_fmt', pix_fmt]
+    if copy_audio:
+        ffmpeg_cmd += ['-c:a', 'copy']
+    # Copy all metadata from original video (creation time, GPS, etc.)
+    ffmpeg_cmd += ['-map_metadata', '1' if copy_audio else '0', '-movflags', 'use_metadata_tags']
+    ffmpeg_cmd += ['-shortest', video_data["output_video_path"], '-y']
     
     try:
         subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
@@ -309,6 +349,12 @@ if __name__ == "__main__":
     parser.add_argument('output', help='Output file or directory path')
     parser.add_argument('--red-filter', action='store_true', 
                         help='Reduce red saturation (use when camera has red filter)')
+    parser.add_argument('--video-codec', default='libx264', help='ffmpeg video codec (e.g., libx264, libx265, prores_ks)')
+    parser.add_argument('--crf', type=int, default=18, help='ffmpeg CRF (lower is higher quality; typical 16-23)')
+    parser.add_argument('--preset', default='medium', help='ffmpeg preset (e.g., slow, medium, fast)')
+    parser.add_argument('--pix-fmt', default='yuv420p', help='ffmpeg pixel format (e.g., yuv420p, yuv422p, yuv444p)')
+    parser.add_argument('--no-audio-copy', action='store_true', help='Do not copy audio from source')
+    parser.add_argument('--strength', type=float, default=STRENGTH_DEFAULT, help='Blend strength of correction (0..1)')
     
     args = parser.parse_args()
 
@@ -316,7 +362,7 @@ if __name__ == "__main__":
         mat = cv2.imread(args.input)
         mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
         
-        corrected_mat = correct(mat, red_filter=args.red_filter)
+        corrected_mat = correct(mat, red_filter=args.red_filter, strength=args.strength)
 
         cv2.imwrite(args.output, corrected_mat)
     
@@ -324,8 +370,14 @@ if __name__ == "__main__":
         for item in analyze_video(args.input, args.output):
             if type(item) == dict:
                 video_data = item
-            
-        [x for x in process_video(video_data, yield_preview=False, red_filter=args.red_filter)]
+                video_data["codec"] = args.video_codec
+                video_data["crf"] = args.crf
+                video_data["preset"] = args.preset
+                video_data["pix_fmt"] = args.pix_fmt
+                video_data["copy_audio"] = not args.no_audio_copy
+                video_data["strength"] = args.strength
+        
+        [x for x in process_video(video_data, yield_preview=False, red_filter=args.red_filter, strength=args.strength)]
     
     else:  # batch mode
         input_dir = Path(args.input)
@@ -363,8 +415,14 @@ if __name__ == "__main__":
                     for item in analyze_video(str(input_file), str(output_file)):
                         if type(item) == dict:
                             video_data = item
+                            video_data["codec"] = args.video_codec
+                            video_data["crf"] = args.crf
+                            video_data["preset"] = args.preset
+                            video_data["pix_fmt"] = args.pix_fmt
+                            video_data["copy_audio"] = not args.no_audio_copy
+                            video_data["strength"] = args.strength
                     
-                    [x for x in process_video(video_data, yield_preview=False, red_filter=args.red_filter)]
+                    [x for x in process_video(video_data, yield_preview=False, red_filter=args.red_filter, strength=args.strength)]
                     print(f"✓ Completed {input_file.name}")
                 except Exception as e:
                     print(f"✗ Error processing {input_file.name}: {e}")
@@ -373,7 +431,7 @@ if __name__ == "__main__":
                 try:
                     mat = cv2.imread(str(input_file))
                     mat = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
-                    corrected_mat = correct(mat, red_filter=args.red_filter)
+                    corrected_mat = correct(mat, red_filter=args.red_filter, strength=args.strength)
                     cv2.imwrite(str(output_file), corrected_mat)
                     print(f"✓ Completed {input_file.name}")
                 except Exception as e:
